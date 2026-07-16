@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install aiosqlite
+      - name: Ruff
+        run: ruff check app tests || true
+      - name: Unit tests
+        env:
+          SECRET_KEY: test-secret-key-min-32-characters-long!!
+          DATABASE_URL: sqlite+aiosqlite:///:memory:
+          DATABASE_URL_SYNC: sqlite:///:memory:
+          REDIS_URL: redis://localhost:6379/0
+          FILE_STORAGE_PATH: /tmp/uploads
+          APP_ENV: test
+        run: pytest -q --cov=app --cov-report=xml
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install
+        run: npm ci || npm install
+      - name: Build
+        run: npm run build
+        env:
+          VITE_API_BASE_URL: /api/v1
+
+  security:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt aiosqlite
+      - name: Security tests
+        env:
+          SECRET_KEY: test-secret-key-min-32-characters-long!!
+          DATABASE_URL: sqlite+aiosqlite:///:memory:
+          DATABASE_URL_SYNC: sqlite:///:memory:
+          FILE_STORAGE_PATH: /tmp/uploads
+          APP_ENV: test
+        run: pytest -q tests/security tests/unit

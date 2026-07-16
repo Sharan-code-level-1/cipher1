@@ -1,0 +1,642 @@
+================================================================================
+AUTOCLAIM AI
+Enterprise Vehicle Damage Assessment & Fraud Detection Platform
+COMPLETE WORKFLOW & SYSTEM BEHAVIOR
+================================================================================
+
+Project purpose
+---------------
+AutoClaim AI is not only an AI model. It is a full insurance claim management
+ecosystem that:
+
+  1. Accepts vehicle damage claims from customers
+  2. Analyzes uploaded photos with AI
+  3. Detects fraud risk with explainable signals
+  4. Estimates repair cost (parts, labour, paint, tax)
+  5. Routes claims to surveyors / fraud analysts
+  6. Supports approve / reject / payment / close
+  7. Logs every security-sensitive action for audit
+  8. Shows enterprise analytics for admins
+
+The system is designed for production deployment, security review, penetration
+testing, and live adversarial testing (System Siege competition style).
+
+
+================================================================================
+1. ACTORS (WHO USES THE SYSTEM)
+================================================================================
+
+Role                  | What they do
+----------------------+---------------------------------------------------------
+Customer              | Registers, adds vehicles, files claims, uploads photos
+Surveyor              | Reviews AI results, inspects claims, approves/rejects
+Insurance Officer     | Oversees claims, payments, policies, analytics
+Repair Workshop       | Views repair-related claim data / updates
+Fraud Analyst         | Reviews high-risk claims and fraud signals
+Admin                 | Users, dashboards, audit, configuration
+Super Admin           | Full control, role matrix, system-level settings
+
+
+================================================================================
+2. HIGH-LEVEL CLAIM LIFECYCLE (END-TO-END)
+================================================================================
+
+                    CUSTOMER JOURNEY
+                    ================
+
+  [A] Register / Login
+           |
+           v
+  [B] Add Vehicle (+ optional Policy)
+           |
+           v
+  [C] Create Claim (draft)
+           |
+           v
+  [D] Upload Damage Photos
+           |
+           v
+  [E] Submit Claim
+           |
+           v
+  ============================================================
+  |                 AUTOMATED AI PIPELINE                      |
+  |------------------------------------------------------------|
+  |  [F1] Damage Detection (parts + damage types + boxes)      |
+  |  [F2] Severity Classification (minor -> total loss)        |
+  |  [F3] Cost Estimation (OEM + labour + paint + GST invoice) |
+  |  [F4] Fraud Assessment (multi-signal risk score)           |
+  ============================================================
+           |
+           +-- if fraud risk HIGH/CRITICAL --> [G] Fraud Review
+           |
+           +-- otherwise --------------------> [H] Surveyor Review
+           |
+           v
+  [I] Surveyor decision
+           |
+           +-- Approve --> [J] Payment Pending --> [K] Paid --> [L] Closed
+           |
+           +-- Reject --> [M] Rejected --> [L] Closed
+
+
+Status machine (exact statuses used by the system)
+--------------------------------------------------
+  draft
+  submitted
+  ai_processing
+  fraud_review
+  surveyor_review
+  approved
+  rejected
+  payment_pending
+  paid
+  closed
+
+
+Valid transitions
+-----------------
+  draft            -> submitted
+  submitted        -> ai_processing
+  ai_processing    -> fraud_review | surveyor_review
+  fraud_review     -> surveyor_review | rejected
+  surveyor_review  -> approved | rejected
+  approved         -> payment_pending
+  payment_pending  -> paid
+  paid             -> closed
+  rejected         -> closed
+
+
+================================================================================
+3. DETAILED STEP-BY-STEP WORKFLOW
+================================================================================
+
+--------------------------------------------------------------------------------
+STEP A — Authentication
+--------------------------------------------------------------------------------
+What happens:
+  - Customer/Admin/Surveyor opens the web app
+  - Login with email + password
+  - Backend verifies Argon2id password hash
+  - On failure: failed-login counter increases; lockout after threshold
+  - On success:
+      * Access JWT issued (short lived, ~15 minutes)
+      * Refresh JWT issued (rotating family token)
+      * Permissions for role embedded / derived from RBAC matrix
+      * Audit log: auth.login
+
+Related APIs:
+  POST /api/v1/auth/register
+  POST /api/v1/auth/login
+  POST /api/v1/auth/refresh
+  POST /api/v1/auth/logout
+  GET  /api/v1/auth/me
+  POST /api/v1/auth/password-reset/request
+  POST /api/v1/auth/password-reset/confirm
+
+Security behavior:
+  - JWT type validation (access vs refresh)
+  - Refresh rotation + reuse detection (revokes whole token family)
+  - Secure error messages (no stack traces to clients)
+  - Rate limiting on login path
+
+
+--------------------------------------------------------------------------------
+STEP B — Vehicle & Policy setup
+--------------------------------------------------------------------------------
+What happens:
+  - Customer adds vehicle details:
+      VIN, registration number, make, model, year, color, odometer, body type
+  - Optional: attach insurance policy
+      policy number, insurer, coverage type, dates, sum insured, deductible
+  - Ownership is bound to the customer user id (IDOR protected)
+
+Related APIs:
+  POST /api/v1/vehicles
+  GET  /api/v1/vehicles
+  GET  /api/v1/vehicles/{vehicle_id}
+  POST /api/v1/vehicles/policies
+  GET  /api/v1/vehicles/{vehicle_id}/policies
+
+Why this matters later:
+  - Fraud engine checks VIN/policy consistency
+  - Cost estimator can use vehicle make context
+  - Claims must reference a real owned vehicle
+
+
+--------------------------------------------------------------------------------
+STEP C — Create claim (draft)
+--------------------------------------------------------------------------------
+What happens:
+  - Customer selects vehicle (+ optional policy)
+  - Enters incident date, location, GPS, description
+  - System creates claim with unique claim_number (e.g. CLM-YYYYMMDD-XXXXXX)
+  - Status = draft
+  - Status history row written
+  - Audit log: claim.create
+
+Related API:
+  POST /api/v1/claims
+
+Access control:
+  - Customer can only create for their own vehicle
+  - Staff roles can access broader claim sets later
+
+
+--------------------------------------------------------------------------------
+STEP D — Upload damage images
+--------------------------------------------------------------------------------
+What happens:
+  - Customer uploads one or more photos (JPEG / PNG / WebP)
+  - Backend validates each file before storage:
+
+      1. Size limit (default 15 MB)
+      2. Extension allow-list
+      3. Magic-byte content sniffing (not just extension)
+      4. Image decode / integrity check (PIL)
+      5. Resolution bounds (too small / too large rejected)
+      6. Path traversal / unsafe filename sanitization
+      7. SHA-256 content hash
+      8. Perceptual hash (phash) for similarity search
+      9. EXIF extraction (camera, software, timestamps)
+     10. Thumbnail generation
+     11. Virus scan status hook (clean/pending/infected)
+
+  - Files stored under isolated claim path
+  - ClaimImage DB rows created
+  - Audit log: claim.image_upload
+
+Related API:
+  POST /api/v1/claims/{claim_id}/images  (multipart form-data)
+
+Security goal:
+  Block malicious uploads, polyglots, path escape, oversized DoS payloads.
+
+
+--------------------------------------------------------------------------------
+STEP E — Submit claim
+--------------------------------------------------------------------------------
+What happens:
+  - Customer submits draft claim
+  - Validation: at least one image required
+  - Status moves: draft -> submitted
+  - submitted_at timestamp set
+  - AI pipeline starts immediately (sync path for reliability; Celery available
+    for scale-out workers)
+
+Related API:
+  POST /api/v1/claims/{claim_id}/submit
+
+Audit log:
+  claim.submit
+
+
+--------------------------------------------------------------------------------
+STEP F — Automated AI pipeline (core intelligence)
+--------------------------------------------------------------------------------
+Status becomes: ai_processing
+
+The pipeline runs four engines in sequence.
+
+
+F1) DAMAGE DETECTION ENGINE
+---------------------------
+Module: backend/app/ai/damage_detector.py
+
+Input:
+  - Claim image bytes
+
+Does:
+  - Detects vehicle parts:
+      bumper, door, hood, roof, mirror, windshield, headlights,
+      tail lights, windows, wheel, tyres
+  - Detects damage types:
+      dent, scratch, paint damage, broken glass, crack, broken light,
+      bent metal, flood damage, fire damage, total loss
+  - Returns:
+      * Bounding boxes
+      * Part labels
+      * Damage type labels
+      * Confidence scores
+      * Damage area %
+      * Explainability payload (reason, affected parts, repair hint)
+
+Notes:
+  - Interface is YOLOv11-compatible
+  - Current package includes a deterministic simulator for demo/CI without
+    shipping large model weights
+  - Real YOLO/ONNX/TensorRT weights can replace the simulator without changing
+    the API contract
+
+Persisted as:
+  DamageDetection rows linked to claim + image
+
+
+F2) SEVERITY CLASSIFICATION
+---------------------------
+Module: backend/app/ai/severity.py
+
+Uses damage area + damage types to classify:
+
+  minor
+  moderate
+  major
+  critical
+  total_loss
+
+Result written onto Claim.severity
+
+
+F3) COST ESTIMATION ENGINE
+--------------------------
+Module: backend/app/ai/cost_estimator.py
+
+Inputs:
+  - Severity
+  - Detected damages/parts
+  - Vehicle make context
+
+Calculates:
+  - OEM parts cost (repair vs replace heuristic)
+  - Labour hours * labour rate
+  - Painting costs where relevant
+  - Taxes (e.g. GST 18%)
+  - Grand total
+  - Estimated repair days
+  - Full invoice JSON + line items
+  - Explanation of method/multipliers
+
+Persisted as:
+  CostEstimate rows
+  Claim.estimated_cost = grand_total
+
+
+F4) FRAUD DETECTION ENGINE
+--------------------------
+Module: backend/app/ai/fraud_engine.py
+
+Multi-signal ensemble. Each signal has:
+  signal_type, severity, weight, message, evidence
+
+Signals checked include:
+  - Duplicate images on same claim
+  - SHA-256 hash match across other claims
+  - Perceptual hash similarity across claims
+  - Missing / stripped EXIF
+  - Photoshop / editor software in EXIF
+  - EXIF DateTime vs DateTimeOriginal mismatch
+  - Photo timestamp vs incident date inconsistency
+  - Repeated claims by same customer
+  - Multiple claims on same vehicle
+  - VIN / policy mismatch
+  - Policy inactive or out-of-coverage-window
+  - Fake GPS (near 0,0)
+  - Edit / compression heuristics
+  - Multi-angle verification (too few images)
+
+Scoring:
+  - Weights summed, capped at 100
+  - Risk levels:
+      low / medium / high / critical
+
+Explainability:
+  - Summary text
+  - Top signals
+  - Methodology note
+
+Persisted as:
+  FraudAssessment + FraudSignal rows
+  Claim.fraud_score = risk_score
+
+Routing decision after AI:
+  - high/critical  -> status = fraud_review
+  - otherwise      -> status = surveyor_review
+
+
+--------------------------------------------------------------------------------
+STEP G/H — Human review queues
+--------------------------------------------------------------------------------
+Surveyor / Fraud Analyst opens queue UI.
+
+They can see:
+  - Claim metadata and images
+  - AI damage detections + confidence + explanations
+  - Cost estimate invoice breakdown
+  - Fraud score + every signal reason
+  - Status history context
+
+Actions:
+  - Add inspection notes
+  - Approve with approved_amount
+  - Reject with rejection_reason
+  - (Admins can force broader transitions)
+
+Related API:
+  PATCH /api/v1/claims/{claim_id}/status
+
+Audit log:
+  claim.status_change
+
+
+--------------------------------------------------------------------------------
+STEP I/J/K/L — Approval, payment, closure
+--------------------------------------------------------------------------------
+If approved:
+  approved -> payment_pending -> paid -> closed
+
+If rejected:
+  rejected -> closed
+
+closed_at timestamp set when closed.
+Full history remains queryable for compliance.
+
+
+================================================================================
+4. ROLE-SPECIFIC WORKFLOWS (UI PANELS)
+================================================================================
+
+CUSTOMER PANEL
+--------------
+  Dashboard
+    - Total claims, open claims, latest estimate
+    - Recent claim table
+  Vehicles
+    - List + add vehicle
+  Claims
+    - List all claims
+    - New claim wizard (vehicle + description + photos + submit)
+  Claim detail
+    - Incident info
+    - Uploaded images
+    - AI damage results
+    - Fraud score summary
+    - Cost breakdown
+  Global search
+    - Own claims / vehicles
+  Notifications
+    - In-app notification list / mark read
+
+SURVEYOR / FRAUD PANEL
+----------------------
+  Queue of pending claims (surveyor_review, fraud_review, etc.)
+  Claim detail with AI suggestions
+  Approve / Reject controls
+  Notes + amount fields
+
+ADMIN / INSURANCE OFFICER PANEL
+-------------------------------
+  Enterprise dashboard KPIs:
+    - Total / pending / approved / rejected
+    - Fraud cases
+    - Average claim cost
+    - Average processing time
+    - Revenue
+  Charts:
+    - Monthly claims
+    - Fraud trend
+    - Claims by status
+    - Severity distribution
+    - Vehicle brand distribution
+  User management (create/update roles)
+  Audit trail browser
+  Permission matrix endpoint
+
+
+================================================================================
+5. CROSS-CUTTING PLATFORM WORKFLOWS
+================================================================================
+
+GLOBAL SEARCH
+-------------
+  GET /api/v1/search?q=...
+  Searches claims, vehicles, users, policies (role-scoped)
+
+NOTIFICATIONS
+-------------
+  Channels: in-app, email (console/SMTP), SMS (console provider)
+  Celery tasks available for async send
+
+AUDIT TRAIL
+-----------
+  Every important action writes AuditLog:
+    actor, action, resource, IP, user-agent, before/after, status, message
+  Used for non-repudiation and incident response
+
+HEALTH / OPS
+------------
+  GET /api/v1/health  (and /health via NGINX)
+  Checks:
+    database connectivity
+    redis connectivity
+    storage writability
+    uptime / version
+
+BACKGROUND WORKERS
+------------------
+  Celery worker + Flower monitoring
+  Tasks:
+    claims.process_ai
+    notifications.send_email
+    notifications.send_sms
+
+
+================================================================================
+6. SECURITY WORKFLOW (DEFENSE IN DEPTH)
+================================================================================
+
+Edge (NGINX)
+  - Reverse proxy
+  - API rate limit zone
+  - Login rate limit zone
+  - Security headers
+  - Hide server tokens
+  - Body size limit
+
+Application (FastAPI)
+  - Request ID correlation
+  - Security headers middleware (CSP, XFO, nosniff, referrer, permissions)
+  - SlowAPI rate limits
+  - CORS allow-list
+  - JWT auth + RBAC/ABAC object checks
+  - Pydantic schema validation (mass assignment protection)
+  - ORM-only DB access (SQLi resistance)
+  - Upload magic-byte + path traversal protection
+  - AES-GCM helpers for encryption at rest
+  - Structured JSON logs
+  - Safe error envelopes
+
+Identity
+  - Argon2id passwords
+  - Account lockout
+  - Refresh rotation + reuse detection
+  - Password reset token hashing
+  - MFA-ready fields
+
+Authorization examples
+  - Customer cannot read another customer's claim (IDOR block)
+  - Customer cannot approve claims
+  - Only privileged roles can manage users
+  - Super-admin required for creating super-admin
+
+
+================================================================================
+7. DATA FLOW SUMMARY
+================================================================================
+
+Browser (React SPA)
+   |  HTTPS / reverse proxy
+   v
+NGINX
+   |  /api/*  ----------------------+
+   |  /* SPA assets                 |
+   v                                v
+Frontend container              Backend FastAPI
+                                    |
+                 +------------------+------------------+
+                 |                  |                  |
+                 v                  v                  v
+            PostgreSQL            Redis           File Storage
+         (users,claims,        (rate/cache,      (images,thumbs)
+          fraud,audit)          celery broker)
+                                    |
+                                    v
+                              Celery Worker
+                           (AI/notifications scale-out)
+
+
+================================================================================
+8. DEV / DEMO RUN WORKFLOW
+================================================================================
+
+1) Extract project
+     tar -xzf autoclaim-ai.tar.gz
+     cd autoclaim-ai
+
+2) Configure environment
+     cp .env.example .env
+     (set SECRET_KEY / AES_MASTER_KEY for non-dev)
+
+3) Start stack
+     docker compose up --build -d
+
+4) Open
+     App via NGINX : http://localhost
+     API docs      : http://localhost:8000/docs
+     Flower        : http://localhost:5555
+
+5) Demo logins
+     customer@autoclaim.ai  / Customer@12345!
+     surveyor@autoclaim.ai  / Surveyor@12345!
+     admin@autoclaim.ai     / Admin@12345!
+
+6) Demo business path
+     Login as customer
+     -> Add vehicle
+     -> New claim + upload photos
+     -> Submit (AI runs)
+     -> Logout
+     -> Login as surveyor
+     -> Open queue / claim detail
+     -> Approve or reject
+     -> Login as admin
+     -> View dashboard + audit logs
+
+
+================================================================================
+9. WHAT EACH MAJOR MODULE “DOES”
+================================================================================
+
+backend/app/ai/damage_detector.py
+  Finds damaged parts/types, boxes, confidence, explanations
+
+backend/app/ai/severity.py
+  Maps detections to severity band
+
+backend/app/ai/cost_estimator.py
+  Builds repair invoice and totals
+
+backend/app/ai/fraud_engine.py
+  Scores fraud risk and explains why
+
+backend/app/services/claim_service.py
+  Orchestrates claim lifecycle + AI pipeline + authorization
+
+backend/app/services/auth_service.py
+  Register/login/refresh/logout/password reset + lockout
+
+backend/app/services/analytics_service.py
+  Aggregates enterprise dashboard metrics
+
+backend/app/services/audit.py
+  Writes immutable-style audit events
+
+backend/app/utils/files.py
+  Secure upload validation and storage helpers
+
+frontend/src/pages/*
+  Role panels for customer, surveyor, admin
+
+docs/*
+  Architecture, threat model, deployment, manuals, diagrams
+
+
+================================================================================
+10. ONE-PAGE “HAPPY PATH” NARRATIVE
+================================================================================
+
+A customer signs in, registers their car, and files a claim after an accident.
+They upload photos of the damage. On submit, AutoClaim AI inspects the images,
+identifies which parts are damaged and how severely, estimates the repair bill,
+and checks for fraud indicators such as reused photos, policy mismatches, or
+suspicious metadata. If risk is elevated, the claim is sent to fraud review;
+otherwise it goes to a surveyor. The surveyor reviews the AI evidence, then
+approves a payout amount or rejects the claim with notes. Every step is audited.
+Admins monitor volumes, fraud trends, costs, and system health from a live
+dashboard.
+
+That is the complete operational workflow of AutoClaim AI.
+
+
+================================================================================
+END OF WORKFLOW DOCUMENT
+================================================================================

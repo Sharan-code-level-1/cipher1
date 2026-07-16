@@ -1,0 +1,131 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: autoclaim
+      POSTGRES_PASSWORD: autoclaim_secret
+      POSTGRES_DB: autoclaim
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Auto-loaded in filename order on FIRST init of an empty data dir:
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autoclaim -d autoclaim"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [autoclaim]
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [autoclaim]
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://autoclaim:autoclaim_secret@postgres:5432/autoclaim
+      DATABASE_URL_SYNC: postgresql://autoclaim:autoclaim_secret@postgres:5432/autoclaim
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      APP_ENV: development
+      RUN_MIGRATIONS: "true"
+    volumes:
+      - uploads:/data/uploads
+    # Apply Alembic migrations (idempotent) then start API.
+    command: >
+      sh -c "alembic upgrade head || true;
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 40s
+    networks: [autoclaim]
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://autoclaim:autoclaim_secret@postgres:5432/autoclaim
+      DATABASE_URL_SYNC: postgresql://autoclaim:autoclaim_secret@postgres:5432/autoclaim
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    volumes:
+      - uploads:/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [autoclaim]
+
+  flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: celery -A app.workers.celery_app flower --port=5555
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    ports:
+      - "5555:5555"
+    depends_on: [redis, worker]
+    networks: [autoclaim]
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: /api/v1
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [autoclaim]
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - uploads:/data/uploads:ro
+    depends_on: [backend, frontend]
+    networks: [autoclaim]
+
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    ports:
+      - "8025:8025"
+    networks: [autoclaim]
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:
+
+networks:
+  autoclaim:
+    driver: bridge
