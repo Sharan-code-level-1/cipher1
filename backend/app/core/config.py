@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173,http://localhost:80"
     allowed_hosts: str = "localhost,127.0.0.1,backend"
 
-    file_storage_path: str = "/data/uploads"
+    file_storage_path: str = "/tmp/uploads"
     max_upload_size_mb: int = 15
     rate_limit_per_minute: int = 60
     login_rate_limit_per_minute: int = 10
