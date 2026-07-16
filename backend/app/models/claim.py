@@ -10,6 +10,12 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base, GUID, JSONVariant, TimestampMixin, UUIDPrimaryKeyMixin
 
 if TYPE_CHECKING:
+    from app.models.ai import AIReport
+    from app.models.evidence import (
+        ConsolidatedDamage,
+        EvidenceRiskAssessment,
+        EvidenceStore,
+    )
     from app.models.fraud import FraudAssessment
     from app.models.user import User
     from app.models.vehicle import Vehicle
@@ -65,6 +71,18 @@ class Claim(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         back_populates="claim", cascade="all, delete-orphan"
     )
     fraud_assessments: Mapped[List["FraudAssessment"]] = relationship(
+        back_populates="claim", cascade="all, delete-orphan"
+    )
+    ai_reports: Mapped[List["AIReport"]] = relationship(
+        back_populates="claim", cascade="all, delete-orphan"
+    )
+    evidence_items: Mapped[List["EvidenceStore"]] = relationship(
+        back_populates="claim", cascade="all, delete-orphan"
+    )
+    consolidated_damages: Mapped[List["ConsolidatedDamage"]] = relationship(
+        back_populates="claim", cascade="all, delete-orphan"
+    )
+    risk_assessments: Mapped[List["EvidenceRiskAssessment"]] = relationship(
         back_populates="claim", cascade="all, delete-orphan"
     )
 
